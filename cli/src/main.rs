@@ -11,9 +11,16 @@ use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
-use xrpl_mithril::wallet::{Algorithm, Wallet};
+use xrpl_mithril::{
+    client::{Client as XrplClient, JsonRpcClient},
+    models::requests::transaction::TxRequest,
+    tx::{autofill::autofill, builder::PaymentBuilder, sign_transaction, submit_and_wait},
+    types::{Amount, XrpAmount},
+    wallet::{Algorithm, Wallet},
+};
 
 const DEFAULT_SERVER_BASE_URL: &str = "https://test-server.textrp.io";
+const DEFAULT_XRPL_RPC_URL: &str = "https://s.altnet.rippletest.net:51234";
 const XRPL_LOGIN_TYPE: &str = "io.briij.login.xrpl";
 const XRPL_NETWORK: &str = "xrpl";
 
@@ -29,6 +36,12 @@ struct Cli {
 enum Commands {
     /// Authenticate with an XRPL address.
     LoginXrpl(LoginXrplArgs),
+    /// Build/sign/optionally submit a Payment transaction.
+    Send(SendArgs),
+    /// Trust-aware payment helper for Briij XRPL flows.
+    Pay(PayArgs),
+    /// Verify a transaction by hash using XRPL JSON-RPC.
+    Verify(VerifyArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -36,6 +49,21 @@ enum SignMethod {
     Xaman,
     Qr,
     LocalSign,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WalletAlgorithmArg {
+    Ed25519,
+    Secp256k1,
+}
+
+impl WalletAlgorithmArg {
+    fn into_wallet_algorithm(self) -> Algorithm {
+        match self {
+            WalletAlgorithmArg::Ed25519 => Algorithm::Ed25519,
+            WalletAlgorithmArg::Secp256k1 => Algorithm::Secp256k1,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -72,6 +100,123 @@ struct LoginXrplArgs {
     /// Explicit sign method; equivalent to the boolean mode flags.
     #[arg(long, value_enum)]
     sign_method: Option<SignMethod>,
+}
+
+#[derive(Debug, Args)]
+struct SendArgs {
+    /// Sender XRPL classic address (r...)
+    #[arg(long)]
+    from_address: String,
+
+    /// Destination XRPL classic address (r...)
+    #[arg(long)]
+    to_address: String,
+
+    /// Amount in drops (1 XRP = 1,000,000 drops)
+    #[arg(long)]
+    amount_drops: u64,
+
+    /// Optional destination tag.
+    #[arg(long)]
+    destination_tag: Option<u32>,
+
+    /// Optional sequence (if omitted and --submit used, autofill resolves it).
+    #[arg(long)]
+    sequence: Option<u32>,
+
+    /// Optional last ledger sequence.
+    #[arg(long)]
+    last_ledger_sequence: Option<u32>,
+
+    /// Optional fee in drops.
+    #[arg(long)]
+    fee_drops: Option<u64>,
+
+    /// XRPL seed for signing. Keep this in env var in production.
+    #[arg(long)]
+    seed: Option<String>,
+
+    /// Seed algorithm.
+    #[arg(long, value_enum, default_value = "secp256k1")]
+    algorithm: WalletAlgorithmArg,
+
+    /// XRPL JSON-RPC endpoint.
+    #[arg(long, default_value = DEFAULT_XRPL_RPC_URL)]
+    rpc_url: String,
+
+    /// Submit transaction and wait for validation (requires --seed).
+    #[arg(long)]
+    submit: bool,
+}
+
+#[derive(Debug, Args)]
+struct PayArgs {
+    /// Payer XRPL classic address (r...)
+    #[arg(long)]
+    payer: String,
+
+    /// Payee XRPL classic address (r...)
+    #[arg(long)]
+    payee: String,
+
+    /// Amount in drops (1 XRP = 1,000,000 drops)
+    #[arg(long)]
+    amount_drops: u64,
+
+    /// Base server URL for trust verification.
+    #[arg(long, default_value = DEFAULT_SERVER_BASE_URL)]
+    server: String,
+
+    /// Matrix access token for trust endpoint authorization.
+    #[arg(long)]
+    access_token: Option<String>,
+
+    /// Skip trust endpoint check before building payment.
+    #[arg(long)]
+    skip_trust_check: bool,
+
+    /// Optional destination tag.
+    #[arg(long)]
+    destination_tag: Option<u32>,
+
+    /// Optional sequence.
+    #[arg(long)]
+    sequence: Option<u32>,
+
+    /// Optional last ledger sequence.
+    #[arg(long)]
+    last_ledger_sequence: Option<u32>,
+
+    /// Optional fee in drops.
+    #[arg(long)]
+    fee_drops: Option<u64>,
+
+    /// XRPL seed for signing.
+    #[arg(long)]
+    seed: Option<String>,
+
+    /// Seed algorithm.
+    #[arg(long, value_enum, default_value = "secp256k1")]
+    algorithm: WalletAlgorithmArg,
+
+    /// XRPL JSON-RPC endpoint.
+    #[arg(long, default_value = DEFAULT_XRPL_RPC_URL)]
+    rpc_url: String,
+
+    /// Submit transaction and wait for validation (requires --seed).
+    #[arg(long)]
+    submit: bool,
+}
+
+#[derive(Debug, Args)]
+struct VerifyArgs {
+    /// Transaction hash (64-char hex).
+    #[arg(long)]
+    tx_hash: String,
+
+    /// XRPL JSON-RPC endpoint.
+    #[arg(long, default_value = DEFAULT_XRPL_RPC_URL)]
+    rpc_url: String,
 }
 
 impl LoginXrplArgs {
@@ -180,6 +325,9 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Commands::LoginXrpl(args) => run_login_xrpl(&client, args).await,
+        Commands::Send(args) => run_send(args).await,
+        Commands::Pay(args) => run_pay(&client, args).await,
+        Commands::Verify(args) => run_verify(args).await,
     }
 }
 
@@ -281,6 +429,219 @@ async fn run_login_xrpl(client: &reqwest::Client, args: LoginXrplArgs) -> Result
 
     println!("Prepared XRPL login for address {} using {:?} signing flow.", args.address, method);
     Ok(())
+}
+
+async fn run_send(args: SendArgs) -> Result<()> {
+    execute_payment_command(
+        &args.from_address,
+        &args.to_address,
+        args.amount_drops,
+        args.destination_tag,
+        args.sequence,
+        args.last_ledger_sequence,
+        args.fee_drops,
+        args.seed.as_deref(),
+        args.algorithm,
+        &args.rpc_url,
+        args.submit,
+    )
+    .await
+}
+
+async fn run_pay(client: &reqwest::Client, args: PayArgs) -> Result<()> {
+    if !args.skip_trust_check {
+        let trust = check_trust(
+            client,
+            &args.server,
+            args.access_token.as_deref(),
+            &args.payer,
+            &args.payee,
+        )
+        .await?;
+        if !trust {
+            bail!("trust check failed: payer {} does not trust payee {}", args.payer, args.payee);
+        }
+        println!("Trust check passed for {} -> {}.", args.payer, args.payee);
+    } else {
+        println!("Skipping trust check as requested.");
+    }
+
+    execute_payment_command(
+        &args.payer,
+        &args.payee,
+        args.amount_drops,
+        args.destination_tag,
+        args.sequence,
+        args.last_ledger_sequence,
+        args.fee_drops,
+        args.seed.as_deref(),
+        args.algorithm,
+        &args.rpc_url,
+        args.submit,
+    )
+    .await
+}
+
+async fn run_verify(args: VerifyArgs) -> Result<()> {
+    let client = JsonRpcClient::new(&args.rpc_url)
+        .with_context(|| format!("failed to initialize XRPL JSON-RPC client {}", args.rpc_url))?;
+    let response = client
+        .request(TxRequest {
+            transaction: args.tx_hash.to_ascii_uppercase(),
+            binary: Some(false),
+            min_ledger: None,
+            max_ledger: None,
+        })
+        .await
+        .context("failed to fetch transaction by hash")?;
+
+    let payload = json!({
+        "hash": response.hash.map(|hash| hash.to_string()),
+        "ledger_index": response.ledger_index,
+        "validated": response.validated,
+        "meta": response.meta,
+        "tx_data": response.tx_data,
+    });
+    println!(
+        "Verify result:\n{}",
+        serde_json::to_string_pretty(&payload).context("failed to render verify output")?
+    );
+    Ok(())
+}
+
+async fn execute_payment_command(
+    from_address: &str,
+    to_address: &str,
+    amount_drops: u64,
+    destination_tag: Option<u32>,
+    sequence: Option<u32>,
+    last_ledger_sequence: Option<u32>,
+    fee_drops: Option<u64>,
+    seed: Option<&str>,
+    algorithm: WalletAlgorithmArg,
+    rpc_url: &str,
+    submit: bool,
+) -> Result<()> {
+    let mut builder = PaymentBuilder::new()
+        .account(from_address.parse().context("invalid from/payer XRPL address")?)
+        .destination(to_address.parse().context("invalid to/payee XRPL address")?)
+        .amount(Amount::Xrp(
+            XrpAmount::from_drops(amount_drops).context("invalid XRP drops amount")?,
+        ));
+
+    if let Some(tag) = destination_tag {
+        builder = builder.destination_tag(tag);
+    }
+    if let Some(seq) = sequence {
+        builder = builder.sequence(seq);
+    }
+    if let Some(lls) = last_ledger_sequence {
+        builder = builder.last_ledger_sequence(lls);
+    }
+    if let Some(fee) = fee_drops {
+        builder = builder
+            .fee(Amount::Xrp(XrpAmount::from_drops(fee).context("invalid fee drops amount")?));
+    }
+
+    let unsigned = builder.build().context("failed to build unsigned payment transaction")?;
+    let unsigned_json =
+        Value::Object(unsigned.to_json_map().context("failed to serialize unsigned transaction")?);
+    println!(
+        "Unsigned payment transaction:\n{}",
+        serde_json::to_string_pretty(&unsigned_json)
+            .context("failed to render unsigned tx json")?
+    );
+
+    if submit && seed.is_none() {
+        bail!("--submit requires --seed so the transaction can be signed");
+    }
+
+    if let Some(seed) = seed {
+        let wallet =
+            Wallet::from_seed_encoded_with_algorithm(seed, algorithm.into_wallet_algorithm())
+                .context("failed to decode XRPL seed")?;
+        if wallet.classic_address() != from_address {
+            bail!(
+                "seed address mismatch: expected {}, got {}",
+                from_address,
+                wallet.classic_address()
+            );
+        }
+
+        if submit {
+            let rpc_client = JsonRpcClient::new(rpc_url)
+                .with_context(|| format!("failed to initialize XRPL JSON-RPC client {rpc_url}"))?;
+            let mut tx_to_submit = unsigned.clone();
+            autofill(&rpc_client, &mut tx_to_submit)
+                .await
+                .context("autofill failed before signing")?;
+
+            let signed = sign_transaction(&tx_to_submit, &wallet)
+                .context("failed to sign autofilled transaction")?;
+            println!("Signed hash: {}", signed.hash());
+            let submit_result =
+                submit_and_wait(&rpc_client, &signed).await.context("submit_and_wait failed")?;
+            println!(
+                "Submission result: hash={} result_code={} ledger_index={}",
+                submit_result.hash, submit_result.result_code, submit_result.ledger_index
+            );
+        } else {
+            let signed =
+                sign_transaction(&unsigned, &wallet).context("failed to sign transaction")?;
+            println!("Signed hash: {}", signed.hash());
+            println!("Signed tx blob: {}", signed.tx_blob());
+            println!(
+                "Signed tx json:\n{}",
+                serde_json::to_string_pretty(&Value::Object(signed.tx_json().clone()))
+                    .context("failed to render signed tx json")?
+            );
+        }
+    } else {
+        println!("No seed provided; transaction built only (unsigned).");
+    }
+
+    Ok(())
+}
+
+async fn check_trust(
+    client: &reqwest::Client,
+    server: &str,
+    access_token: Option<&str>,
+    payer: &str,
+    payee: &str,
+) -> Result<bool> {
+    let server_base = normalize_base_url(server)?;
+    let trust_url = join_url(&server_base, "/_matrix/client/v3/org.textrp.xrpl/trust")?;
+    let request = client.get(&trust_url).query(&[("payer", payer), ("payee", payee)]);
+    let request = if let Some(token) = access_token { request.bearer_auth(token) } else { request };
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("failed to call trust endpoint {trust_url}"))?;
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "trust endpoint failed at {} with {}: {}",
+            trust_url,
+            status,
+            truncate_for_log(&body_text, 240)
+        );
+    }
+
+    let body: Value = serde_json::from_str(&body_text).context("failed to parse trust response")?;
+    println!(
+        "Trust endpoint response:\n{}",
+        serde_json::to_string_pretty(&body).context("failed to format trust response")?
+    );
+
+    let trusted = body
+        .get("trusted")
+        .and_then(Value::as_bool)
+        .or_else(|| body.get("score").and_then(Value::as_i64).map(|score| score > 0))
+        .unwrap_or(false);
+    Ok(trusted)
 }
 
 fn extract_wallet_challenge_from_payload(payload: &Value) -> Option<Value> {
