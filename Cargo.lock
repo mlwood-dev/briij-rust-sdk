@@ -594,9 +594,15 @@ dependencies = [
 name = "briij-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "qr2term",
  "qrcode",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
  "urlencoding",
  "xrpl-mithril",
 ]
@@ -5070,6 +5076,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
