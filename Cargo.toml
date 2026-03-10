@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "cli",
     "benchmarks",
     "bindings/matrix-sdk-crypto-ffi",
     "bindings/matrix-sdk-ffi",
