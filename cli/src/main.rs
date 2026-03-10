@@ -1,16 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::Duration,
+    io::{self, Write},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use rand::{Rng, distributions::Alphanumeric};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
+use xrpl_mithril::wallet::{Algorithm, Wallet};
 
 const DEFAULT_SERVER_BASE_URL: &str = "https://test-server.textrp.io";
+const XRPL_LOGIN_TYPE: &str = "io.briij.login.xrpl";
+const XRPL_NETWORK: &str = "xrpl";
 
 #[derive(Debug, Parser)]
 #[command(name = "briij-cli")]
@@ -122,6 +127,7 @@ struct DiscoveryResult {
     input_base_url: String,
     homeserver_base_url: String,
     matrix_versions: Vec<String>,
+    login_flow_types: Vec<String>,
     unstable_features: BTreeMap<String, Value>,
     xrpl_endpoint_hints: Vec<String>,
 }
@@ -187,27 +193,289 @@ async fn run_login_xrpl(client: &reqwest::Client, args: LoginXrplArgs) -> Result
         discovery.homeserver_base_url, discovery.input_base_url
     );
     println!("Server supports {} Matrix versions.", discovery.matrix_versions.len());
-
-    let challenge =
-        fetch_xrpl_challenge(client, &discovery, &args.address, args.challenge_endpoint.as_deref())
-            .await?;
-    println!("Challenge endpoint: {} {}", challenge.method, challenge.url);
-    println!("Challenge source: {}", challenge.source);
-    println!(
-        "Challenge payload:\n{}",
-        serde_json::to_string_pretty(&challenge.payload)
-            .context("failed to format challenge payload")?
-    );
-
-    println!("Prepared XRPL login for address {} using {:?} signing flow.", args.address, method);
-
-    if matches!(method, SignMethod::LocalSign) {
+    if !discovery.login_flow_types.iter().any(|flow| flow == XRPL_LOGIN_TYPE) {
         eprintln!(
-            "WARNING: --local-sign uses a local wallet in memory only. Never persist private keys."
+            "WARNING: server did not advertise {} in GET /login flows. Attempting anyway.",
+            XRPL_LOGIN_TYPE
         );
     }
 
+    let server_challenge =
+        fetch_xrpl_challenge(client, &discovery, &args.address, args.challenge_endpoint.as_deref())
+            .await;
+
+    let mut challenge_payload = match &server_challenge {
+        Ok(challenge) => {
+            println!("Challenge endpoint: {} {}", challenge.method, challenge.url);
+            println!("Challenge source: {}", challenge.source);
+            println!(
+                "Challenge payload:\n{}",
+                serde_json::to_string_pretty(&challenge.payload)
+                    .context("failed to format challenge payload")?
+            );
+            extract_wallet_challenge_from_payload(&challenge.payload).unwrap_or_else(|| {
+                generate_local_wallet_challenge(&args.address, &discovery.homeserver_base_url)
+            })
+        }
+        Err(error) => {
+            eprintln!("Challenge fetch unavailable; falling back to local challenge generation.");
+            eprintln!("Detail: {error:#}");
+            generate_local_wallet_challenge(&args.address, &discovery.homeserver_base_url)
+        }
+    };
+
+    match method {
+        SignMethod::Xaman | SignMethod::Qr => {
+            let xaman_uri = build_xaman_deeplink(
+                server_challenge.as_ref().ok().map(|result| &result.payload),
+                &challenge_payload,
+            )?;
+            println!("Xaman URI:\n{xaman_uri}");
+
+            qrcode::QrCode::new(xaman_uri.as_bytes())
+                .context("failed to encode Xaman URI as QR payload")?;
+            qr2term::print_qr(&xaman_uri).context("failed to print terminal QR code")?;
+
+            println!("Manual fallback: paste signing values below.");
+            let pasted_public_key = prompt_required("Public key (hex): ")?;
+            let pasted_signature = prompt_required("Signature (hex): ")?;
+            let algorithm = algorithm_from_public_key(&pasted_public_key);
+            upsert_challenge_signer_fields(&mut challenge_payload, &pasted_public_key, algorithm);
+            let login_response = submit_wallet_login(
+                client,
+                &discovery,
+                &args.address,
+                challenge_payload,
+                pasted_signature,
+            )
+            .await?;
+            println!(
+                "Login response:\n{}",
+                serde_json::to_string_pretty(&login_response)
+                    .context("failed to format login response")?
+            );
+        }
+        SignMethod::LocalSign => {
+            eprintln!("WARNING: --local-sign is for development use only.");
+            eprintln!("WARNING: Never persist or commit XRPL seeds/private keys.");
+
+            let (public_key_hex, signature_hex) =
+                local_sign_challenge(&args.address, &challenge_payload)?;
+            upsert_challenge_signer_fields(&mut challenge_payload, &public_key_hex, "ed25519");
+
+            let login_response = submit_wallet_login(
+                client,
+                &discovery,
+                &args.address,
+                challenge_payload,
+                signature_hex,
+            )
+            .await?;
+            println!(
+                "Login response:\n{}",
+                serde_json::to_string_pretty(&login_response)
+                    .context("failed to format login response")?
+            );
+        }
+    }
+
+    println!("Prepared XRPL login for address {} using {:?} signing flow.", args.address, method);
     Ok(())
+}
+
+fn extract_wallet_challenge_from_payload(payload: &Value) -> Option<Value> {
+    let challenge = payload
+        .as_object()
+        .and_then(|obj| obj.get("challenge"))
+        .cloned()
+        .unwrap_or_else(|| payload.clone());
+
+    let has_required_fields = challenge.get("nonce").is_some()
+        && challenge.get("timestamp").is_some()
+        && challenge.get("message").is_some();
+    if has_required_fields { Some(challenge) } else { None }
+}
+
+fn generate_local_wallet_challenge(address: &str, server_base_url: &str) -> Value {
+    let nonce: String =
+        rand::thread_rng().sample_iter(&Alphanumeric).take(24).map(char::from).collect();
+    let timestamp_ms =
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    let message = format!(
+        "Briij XRPL login\nwallet_address={address}\nnonce={nonce}\ntimestamp={timestamp_ms}\nserver={server_base_url}"
+    );
+
+    json!({
+        "nonce": nonce,
+        "timestamp": timestamp_ms,
+        "message": message,
+        "network": XRPL_NETWORK,
+    })
+}
+
+fn build_xaman_deeplink(
+    server_payload: Option<&Value>,
+    challenge_payload: &Value,
+) -> Result<String> {
+    if let Some(token) = server_payload.and_then(extract_xaman_payload_token) {
+        if token.starts_with("xaman://") {
+            return Ok(token);
+        }
+        return Ok(format!("xaman://sign?payload={}", urlencoding::encode(&token)));
+    }
+
+    let challenge_json = serde_json::to_string(challenge_payload)
+        .context("failed to serialize local challenge for Xaman deeplink")?;
+    Ok(format!("xaman://sign?payload={}", urlencoding::encode(&challenge_json)))
+}
+
+fn extract_xaman_payload_token(payload: &Value) -> Option<String> {
+    if let Some(token) = payload.get("payload").and_then(Value::as_str) {
+        return Some(token.to_owned());
+    }
+    if let Some(token) = payload.get("payload_id").and_then(Value::as_str) {
+        return Some(token.to_owned());
+    }
+    if let Some(token) = payload.get("uuid").and_then(Value::as_str) {
+        return Some(token.to_owned());
+    }
+    if let Some(xaman) = payload.get("xaman") {
+        if let Some(token) = xaman.get("payload").and_then(Value::as_str) {
+            return Some(token.to_owned());
+        }
+        if let Some(token) = xaman.get("payload_id").and_then(Value::as_str) {
+            return Some(token.to_owned());
+        }
+        if let Some(token) = xaman.get("uuid").and_then(Value::as_str) {
+            return Some(token.to_owned());
+        }
+    }
+    None
+}
+
+fn prompt_required(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush().context("failed to flush stdout prompt")?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).context("failed to read terminal input")?;
+    let trimmed = input.trim().to_owned();
+    if trimmed.is_empty() {
+        bail!("required value cannot be empty");
+    }
+    Ok(trimmed)
+}
+
+fn local_sign_challenge(address: &str, challenge_payload: &Value) -> Result<(String, String)> {
+    let message = challenge_payload
+        .get("message")
+        .and_then(Value::as_str)
+        .context("challenge payload is missing message field")?;
+
+    let seed = match std::env::var("BRIIJ_XRPL_SEED") {
+        Ok(seed) => seed,
+        Err(_) => {
+            let generated_wallet = Wallet::generate(Algorithm::Ed25519)
+                .context("failed to generate ephemeral xrpl-mithril wallet")?;
+            bail!(
+                "BRIIJ_XRPL_SEED is required for --local-sign.\nGenerated ephemeral wallet address for testing: {}\nRerun with BRIIJ_XRPL_SEED set to your seed (not persisted).",
+                generated_wallet.classic_address()
+            );
+        }
+    };
+
+    let wallet = Wallet::from_seed_encoded_with_algorithm(&seed, Algorithm::Ed25519)
+        .context("failed to decode BRIIJ_XRPL_SEED")?;
+    if wallet.classic_address() != address {
+        bail!(
+            "seed address mismatch: --address={} but seed resolves to {}",
+            address,
+            wallet.classic_address()
+        );
+    }
+
+    let signature = wallet
+        .keypair()
+        .sign(message.as_bytes())
+        .context("failed to sign challenge with local wallet")?;
+    Ok((wallet.public_key_hex(), bytes_to_upper_hex(&signature)))
+}
+
+fn upsert_challenge_signer_fields(
+    challenge_payload: &mut Value,
+    public_key: &str,
+    algorithm: &str,
+) {
+    if !challenge_payload.is_object() {
+        *challenge_payload = json!({ "raw": challenge_payload.clone() });
+    }
+    if let Some(object) = challenge_payload.as_object_mut() {
+        object.insert("public_key".to_owned(), Value::String(public_key.to_owned()));
+        object.insert("algorithm".to_owned(), Value::String(algorithm.to_owned()));
+    }
+}
+
+async fn submit_wallet_login(
+    client: &reqwest::Client,
+    discovery: &DiscoveryResult,
+    wallet_address: &str,
+    challenge_payload: Value,
+    signature_hex: String,
+) -> Result<Value> {
+    let login_url = join_url(&discovery.homeserver_base_url, "/_matrix/client/v3/login")?;
+    let username = fallback_username_from_address(wallet_address);
+    let body = json!({
+        "type": XRPL_LOGIN_TYPE,
+        "identifier": {
+            "type": "m.id.user",
+            "user": username,
+        },
+        "user": username,
+        "wallet_address": wallet_address,
+        "network": XRPL_NETWORK,
+        "challenge": challenge_payload,
+        "signature": signature_hex,
+    });
+
+    let response = client
+        .post(&login_url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("failed to call login endpoint {login_url}"))?;
+    let status = response.status();
+    let body_text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "wallet login failed at {} with {}: {}",
+            login_url,
+            status,
+            truncate_for_log(&body_text, 360)
+        );
+    }
+
+    let parsed =
+        serde_json::from_str::<Value>(&body_text).unwrap_or_else(|_| json!({ "raw": body_text }));
+    Ok(parsed)
+}
+
+fn fallback_username_from_address(address: &str) -> String {
+    let suffix_start = address.len().saturating_sub(10);
+    format!("wallet_{}", address[suffix_start..].to_ascii_lowercase())
+}
+
+fn bytes_to_upper_hex(input: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len() * 2);
+    for byte in input {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn algorithm_from_public_key(public_key: &str) -> &'static str {
+    if public_key.to_ascii_uppercase().starts_with("ED") { "ed25519" } else { "secp256k1" }
 }
 
 async fn discover_server(client: &reqwest::Client, input_server: &str) -> Result<DiscoveryResult> {
@@ -257,9 +525,9 @@ async fn discover_server(client: &reqwest::Client, input_server: &str) -> Result
     };
 
     let mut xrpl_endpoint_hints = extract_xrpl_hints_from_well_known(&well_known_extra);
-    for flow_type in login_flow_types {
+    for flow_type in &login_flow_types {
         if flow_type.to_ascii_lowercase().contains("xrpl") {
-            xrpl_endpoint_hints.push(flow_type);
+            xrpl_endpoint_hints.push(flow_type.to_owned());
         }
     }
     xrpl_endpoint_hints.sort();
@@ -269,6 +537,7 @@ async fn discover_server(client: &reqwest::Client, input_server: &str) -> Result
         input_base_url,
         homeserver_base_url,
         matrix_versions: versions_response.versions,
+        login_flow_types: login_flow_types.clone(),
         unstable_features: versions_response.unstable_features,
         xrpl_endpoint_hints,
     })
